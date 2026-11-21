@@ -1,0 +1,142 @@
+name: Build & Release DKMS .deb
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string (e.g. 1.0.5); defaults to short git SHA'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine package version
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#v}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            TAG="v${{ inputs.version }}"
+            VER="${{ inputs.version }}"
+          else
+            SHA="$(git rev-parse --short HEAD)"
+            TAG=""
+            VER="1.0.5+g${SHA}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "deb=snd-hdspe-dkms_${VER}-1_all.deb" >> "$GITHUB_OUTPUT"
+
+      - name: Build DKMS .deb package
+        env:
+          VER: ${{ steps.meta.outputs.version }}
+          DEB: ${{ steps.meta.outputs.deb }}
+        run: |
+          STAGE="$(mktemp -d)"
+          mkdir -p "${STAGE}/DEBIAN" "${STAGE}/usr/src/alsa-hdspe-${VER}"
+
+          cp -a Makefile dkms.conf LICENSE README.md sound "${STAGE}/usr/src/alsa-hdspe-${VER}/"
+          if [ -d doc ]; then
+            cp -a doc "${STAGE}/usr/src/alsa-hdspe-${VER}/"
+          fi
+          sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${VER}\"/" \
+            "${STAGE}/usr/src/alsa-hdspe-${VER}/dkms.conf"
+
+          cat > "${STAGE}/DEBIAN/control" <<EOF
+          Package: snd-hdspe-dkms
+          Version: ${VER}-1
+          Architecture: all
+          Maintainer: technomagniaque <technomagniaque@users.noreply.github.com>
+          Depends: dkms (>= 2.1.0.0)
+          Section: kernel
+          Priority: optional
+          Description: ALSA driver for RME HDSPe cards (DKMS)
+           Out-of-tree DKMS kernel module snd-hdspe for RME HDSPe RayDAT, AIO,
+           AIO Pro, MADI and AES cards with live DMA hw_ptr, NO_PERIOD_WAKEUP
+           dynamic IRQ gating, 32-sample period fix and threadirqs-safe locking.
+          EOF
+
+          cat > "${STAGE}/DEBIAN/postinst" <<EOF
+          #!/bin/sh
+          set -e
+
+          PKG_NAME="alsa-hdspe"
+          PKG_VER="${VER}"
+
+          if [ "\$1" = "configure" ]; then
+              if dkms status -m "\$PKG_NAME" -v "0.0" 2>/dev/null | grep -q "\$PKG_NAME"; then
+                  dkms remove -m "\$PKG_NAME" -v "0.0" --all || true
+              fi
+              if [ -L "/usr/src/\${PKG_NAME}-0.0" ]; then
+                  rm -f "/usr/src/\${PKG_NAME}-0.0"
+              fi
+
+              dkms add -m "\$PKG_NAME" -v "\$PKG_VER" || true
+              for kver in /lib/modules/*; do
+                  kver="\$(basename "\$kver")"
+                  if [ -d "/lib/modules/\$kver/build" ]; then
+                      dkms build -m "\$PKG_NAME" -v "\$PKG_VER" -k "\$kver" || true
+                      dkms install -m "\$PKG_NAME" -v "\$PKG_VER" -k "\$kver" || true
+                  fi
+              done
+              depmod -a || true
+          fi
+          EOF
+
+          cat > "${STAGE}/DEBIAN/prerm" <<EOF
+          #!/bin/sh
+          set -e
+
+          PKG_NAME="alsa-hdspe"
+          PKG_VER="${VER}"
+
+          if [ "\$1" = "remove" ] || [ "\$1" = "upgrade" ]; then
+              dkms remove -m "\$PKG_NAME" -v "\$PKG_VER" --all || true
+          fi
+          EOF
+
+          chmod 0755 "${STAGE}" "${STAGE}/DEBIAN" "${STAGE}/DEBIAN/postinst" "${STAGE}/DEBIAN/prerm"
+          mkdir -p dist
+          dpkg-deb --build --root-owner-group "${STAGE}" "dist/${DEB}"
+          rm -rf "${STAGE}"
+
+          dpkg-deb -I "dist/${DEB}"
+          dpkg-deb -c "dist/${DEB}"
+          (cd dist && sha256sum "${DEB}" > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snd-hdspe-dkms-deb
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VER: ${{ steps.meta.outputs.version }}
+          DEB: ${{ steps.meta.outputs.deb }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "dist/${DEB}" "dist/SHA256SUMS.txt" --clobber
+          else
+            gh release create "${TAG}" "dist/${DEB}" "dist/SHA256SUMS.txt" \
+              --title "snd-hdspe ${TAG} (DKMS .deb)" \
+              --generate-notes
+          fi
